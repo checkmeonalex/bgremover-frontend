@@ -7,6 +7,8 @@ import { formatBytes } from './utils/formatBytes';
 
 const HEIC_SIGNATURES = ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'];
 const MAX_BATCH_FILES = 50;
+const DEFAULT_QUALITY_PERCENT = 90;
+const QUALITY_COOKIE_NAME = 'alxora_webp_quality';
 const STATUS_STYLES = {
   pending: 'bg-stone-100 text-stone-700',
   processing: 'bg-amber-100 text-amber-800',
@@ -141,6 +143,33 @@ const sanitizeBaseName = (name, index) => {
 
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
+const readQualityCookie = () => {
+  if (typeof document === 'undefined') {
+    return DEFAULT_QUALITY_PERCENT;
+  }
+
+  const match = document.cookie
+    .split('; ')
+    .find((entry) => entry.startsWith(`${QUALITY_COOKIE_NAME}=`));
+
+  if (!match) {
+    return DEFAULT_QUALITY_PERCENT;
+  }
+
+  const value = Number(match.split('=')[1]);
+  return Number.isFinite(value) && value >= 40 && value <= 100
+    ? value
+    : DEFAULT_QUALITY_PERCENT;
+};
+
+const persistQualityCookie = (value) => {
+  if (typeof document === 'undefined') {
+    return;
+  }
+
+  document.cookie = `${QUALITY_COOKIE_NAME}=${value}; max-age=${60 * 60 * 24 * 365}; path=/; SameSite=Lax`;
+};
+
 const createItem = (file) => ({
   id: createId(),
   file,
@@ -161,9 +190,10 @@ const createItem = (file) => ({
 function BackgroundRemoverApp() {
   const [items, setItems] = useState([]);
   const [globalError, setGlobalError] = useState('');
-  const [isProcessingBatch, setIsProcessingBatch] = useState(false);
   const [isCompressingBatch, setIsCompressingBatch] = useState(false);
   const [isZipping, setIsZipping] = useState(false);
+  const [qualityPercent, setQualityPercent] = useState(readQualityCookie);
+  const [batchMode, setBatchMode] = useState('webp');
   const [editorState, setEditorState] = useState({
     open: false,
     itemId: null,
@@ -175,6 +205,10 @@ function BackgroundRemoverApp() {
   useEffect(() => {
     itemsRef.current = items;
   }, [items]);
+
+  useEffect(() => {
+    persistQualityCookie(qualityPercent);
+  }, [qualityPercent]);
 
   useEffect(
     () => () => {
@@ -307,88 +341,48 @@ function BackgroundRemoverApp() {
     [generatePreview, items.length]
   );
 
-  const processSingle = useCallback(
-    async (item) => {
-      updateItem(item.id, {
-        status: 'processing',
-        error: '',
-        resultUrl: '',
-        resultBlob: null,
-        resultSize: 0,
-        compressedUrl: '',
-        compressedBlob: null,
-        compressedSize: 0,
-      });
-
-      try {
-        const blob = await createLocalProcessingBlob(item.file);
-        updateItem(item.id, {
-          status: 'done',
-          resultBlob: blob,
-          resultSize: blob.size,
-          resultUrl: URL.createObjectURL(blob),
-          isCompressing: false,
-          error: 'Backend disconnected. This export keeps the original background.',
-        });
-      } catch (err) {
-        updateItem(item.id, {
-          status: 'error',
-          error: err?.message || 'Local processing failed',
-          isCompressing: false,
-        });
-      }
-    },
-    [updateItem]
-  );
-
-  const handleProcessAll = useCallback(async () => {
-    if (!items.length) {
-      setGlobalError('Add images before processing your Alxora batch.');
-      return;
-    }
-    setGlobalError('');
-    setIsProcessingBatch(true);
-    for (const item of items) {
-      if (item.file) {
-        // eslint-disable-next-line no-await-in-loop
-        await processSingle(item);
-      }
-    }
-    setIsProcessingBatch(false);
-  }, [items, processSingle]);
-
   const compressSingle = useCallback(
     async (item) => {
-      if (!item.resultBlob) return;
-      updateItem(item.id, { isCompressing: true, error: '' });
+      if (!item.file) return;
+      updateItem(item.id, { isCompressing: true, status: 'processing', error: '' });
       try {
-        const canvas = await renderImageToCanvas(item.resultBlob);
-        const compressed = await canvasToBlob(canvas, 'image/webp', 0.75);
+        const sourceBlob = item.resultBlob ?? (await createLocalProcessingBlob(item.file));
+        const canvas = await renderImageToCanvas(sourceBlob);
+        const compressed = await canvasToBlob(
+          canvas,
+          'image/webp',
+          qualityPercent / 100
+        );
         updateItem(item.id, {
           isCompressing: false,
+          status: 'done',
+          resultBlob: sourceBlob,
+          resultSize: sourceBlob.size,
+          resultUrl: URL.createObjectURL(sourceBlob),
           compressedBlob: compressed,
           compressedSize: compressed.size,
           compressedUrl: URL.createObjectURL(compressed),
+          error: '',
         });
       } catch (err) {
         updateItem(item.id, {
           isCompressing: false,
+          status: 'error',
           error: `Compression failed: ${err?.message ?? 'try another image'}`,
         });
       }
     },
-    [updateItem]
+    [qualityPercent, updateItem]
   );
 
   const handleCompressAll = useCallback(async () => {
-    const readyItems = items.filter((item) => item.resultBlob);
-    if (!readyItems.length) {
-      setGlobalError('Process images before creating Alxora-ready WebP exports.');
+    if (!items.length) {
+      setGlobalError('Add images before creating Alxora-ready WebP exports.');
       return;
     }
     setGlobalError('');
     setIsCompressingBatch(true);
-    for (const item of readyItems) {
+    for (const item of items) {
       // eslint-disable-next-line no-await-in-loop
       await compressSingle(item);
     }
@@ -396,11 +390,9 @@ function BackgroundRemoverApp() {
   }, [compressSingle, items]);
 
   const handleDownloadAll = useCallback(async () => {
-    const readyItems = items.filter(
-      (item) => item.compressedBlob || item.resultBlob
-    );
+    const readyItems = items.filter((item) => item.compressedBlob);
     if (!readyItems.length) {
-      setGlobalError('Process or compress at least one file before exporting.');
+      setGlobalError('Create at least one WebP file before exporting.');
       return;
     }
 
@@ -413,13 +405,12 @@ function BackgroundRemoverApp() {
           ''
         );
         const displayName = baseName || `image-${index + 1}`;
-        const primaryBlob = item.compressedBlob ?? item.resultBlob;
+        const primaryBlob = item.compressedBlob;
         if (primaryBlob) {
-          const primaryExt = item.compressedBlob ? 'webp' : 'png';
           const url = URL.createObjectURL(primaryBlob);
           const link = document.createElement('a');
           link.href = url;
-          link.download = `${displayName}-alxora.${primaryExt}`;
+          link.download = `${displayName}-alxora.webp`;
           document.body.appendChild(link);
           link.click();
           document.body.removeChild(link);
@@ -438,24 +429,19 @@ function BackgroundRemoverApp() {
     }
   }, [items]);
 
-  const processedCount = useMemo(
-    () => items.filter((item) => item.status === 'done').length,
+  const convertedCount = useMemo(
+    () => items.filter((item) => item.compressedBlob).length,
     [items]
   );
 
   const readyForZipCount = useMemo(
-    () => items.filter((item) => item.compressedBlob || item.resultBlob).length,
+    () => items.filter((item) => item.compressedBlob).length,
     [items]
   );
 
-  const disableProcess = !items.length || isProcessingBatch;
-  const disableCompress =
-    !items.some((item) => item.resultBlob) ||
-    isCompressingBatch ||
-    isProcessingBatch;
+  const disableCompress = !items.length || isCompressingBatch;
   const disableZip =
-    !items.some((item) => item.compressedBlob || item.resultBlob) ||
-    isProcessingBatch ||
+    !items.some((item) => item.compressedBlob) ||
     isZipping;
 
   const editorItem = useMemo(
@@ -515,6 +501,31 @@ function BackgroundRemoverApp() {
     [closeEditor, editorItem, editorState.target, updateItem]
   );
 
+  const batchModes = [
+    {
+      id: 'webp',
+      label: 'WebP',
+      eyebrow: 'WebP compression',
+      title: 'Control compression without leaving this page',
+      description: 'Adjust the WebP level here, then convert your uploaded files into lighter exports.',
+      actionLabel: isCompressingBatch ? 'Compressing...' : 'Create WebP exports',
+      onAction: handleCompressAll,
+      disabled: disableCompress,
+    },
+    {
+      id: 'export',
+      label: 'Export',
+      eyebrow: 'Download center',
+      title: 'Export everything from the current batch',
+      description: 'Download ready PNG or WebP files directly from this workspace without opening a separate tool page.',
+      actionLabel: isZipping ? 'Starting downloads...' : 'Download all',
+      onAction: handleDownloadAll,
+      disabled: disableZip,
+    },
+  ];
+
+  const activeBatchMode = batchModes.find((mode) => mode.id === batchMode) ?? batchModes[0];
+
   return (
     <div id="top" className="alxora-shell min-h-screen text-stone-900">
       <header className="border-b border-slate-200 bg-white/90 backdrop-blur">
@@ -555,7 +566,7 @@ function BackgroundRemoverApp() {
                   Batch product image editor
                 </h1>
                 <p className="mt-4 text-base leading-7 text-slate-500">
-                  Upload your product images, edit them, process them, compress them, and export
+                  Upload your product images, edit them, compress them, and export
                   them from one clean batch workspace.
                 </p>
               </div>
@@ -576,8 +587,8 @@ function BackgroundRemoverApp() {
                 <p className="mt-2 text-3xl font-semibold text-slate-950">{items.length}</p>
               </div>
               <div className="rounded-md border border-slate-200 bg-[#f8f9fd] p-3">
-                <p className="text-sm text-slate-500">Processed</p>
-                <p className="mt-2 text-3xl font-semibold text-slate-950">{processedCount}</p>
+                <p className="text-sm text-slate-500">WebP ready</p>
+                <p className="mt-2 text-3xl font-semibold text-slate-950">{convertedCount}</p>
               </div>
               <div className="rounded-md border border-slate-200 bg-[#f8f9fd] p-3">
                 <p className="text-sm text-slate-500">Ready to export</p>
@@ -634,72 +645,106 @@ function BackgroundRemoverApp() {
           <section className="mt-6 rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
                 <div className="flex flex-col gap-4 lg:flex-row lg:items-end lg:justify-between">
                   <div>
-                    <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-400">Batch editor</p>
+                    <p className="text-xs font-semibold uppercase tracking-[0.28em] text-slate-400">
+                      {activeBatchMode.eyebrow}
+                    </p>
                     <h2 className="mt-3 text-3xl font-semibold text-slate-900">
-                      Review and export your batch
+                      {activeBatchMode.title}
                     </h2>
                     <p className="mt-3 max-w-3xl text-sm leading-7 text-slate-500">
-                      Keep the existing edit, compress, and export workflow inside the new batch layout.
+                      {activeBatchMode.description}
                     </p>
                   </div>
-                  <div className="flex flex-wrap gap-3">
-                    <button
-                      type="button"
-                      className="rounded-md bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
-                      onClick={handleProcessAll}
-                      disabled={disableProcess}
-                    >
-                      {isProcessingBatch ? 'Processing...' : 'Remove backgrounds'}
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded-md border border-slate-200 px-4 py-2.5 text-sm font-semibold text-slate-900 transition hover:border-slate-300 disabled:cursor-not-allowed disabled:opacity-60"
-                      onClick={handleCompressAll}
-                      disabled={disableCompress}
-                    >
-                      {isCompressingBatch ? 'Compressing...' : 'Create WebP exports'}
-                    </button>
-                    <button
-                      type="button"
-                      className="rounded-md border border-violet-200 bg-violet-50 px-4 py-2.5 text-sm font-semibold text-violet-700 transition hover:border-violet-300 disabled:cursor-not-allowed disabled:opacity-60"
-                      onClick={handleDownloadAll}
-                      disabled={disableZip}
-                    >
-                      {isZipping ? 'Starting downloads...' : 'Download all'}
-                    </button>
+                  <div className="flex flex-col gap-3 lg:items-end">
+                    <div className="inline-flex rounded-md border border-slate-200 bg-slate-50 p-1">
+                      {batchModes.map((mode) => (
+                        <button
+                          key={mode.id}
+                          type="button"
+                          className={`rounded-md px-3 py-2 text-sm font-semibold transition ${
+                            batchMode === mode.id
+                              ? 'bg-slate-900 text-white'
+                              : 'text-slate-600 hover:bg-white hover:text-slate-900'
+                          }`}
+                          onClick={() => setBatchMode(mode.id)}
+                        >
+                          {mode.label}
+                        </button>
+                      ))}
+                    </div>
                   </div>
                 </div>
 
                 <p className="mt-4 text-sm text-slate-500">
-                  {readyForZipCount > 0
-                    ? `${readyForZipCount} file(s) ready for download.`
-                    : 'Process at least one image to enable Download all.'}
+                  {batchMode === 'webp' &&
+                    (convertedCount > 0
+                      ? `${convertedCount} WebP file(s) created with ${qualityPercent}% quality.`
+                      : 'Upload images to start creating WebP exports.')}
+                  {batchMode === 'export' &&
+                    (readyForZipCount > 0
+                      ? `${readyForZipCount} file(s) ready for download.`
+                      : 'Create at least one WebP file to enable Download all.')}
                 </p>
 
                 <div className="mt-6 grid gap-6 lg:grid-cols-[0.9fr,1.1fr]">
                   <div className="rounded-md border border-slate-200 bg-[#fafbfd] p-4">
-                    <label
-                      htmlFor="file-input"
-                      className="flex cursor-pointer flex-col items-center justify-center rounded-md border border-dashed border-slate-300 bg-white px-5 py-10 text-center transition hover:border-slate-400"
-                    >
-                      <span className="mt-5 text-2xl font-semibold text-slate-900">
-                        Import more images
-                      </span>
-                      <span className="mt-3 max-w-md text-sm leading-7 text-slate-500">
-                        PNG, JPG, JPEG, WEBP, or HEIC. Add more files to the current batch anytime.
-                      </span>
-                    </label>
+                    {batchMode === 'webp' && (
+                      <div className="space-y-4">
+                        <div className="rounded-md border border-slate-200 bg-white p-4">
+                          <p className="text-xs uppercase tracking-[0.24em] text-slate-400">
+                            Compression quality
+                          </p>
+                          <div className="mt-3 flex items-center justify-between text-sm text-slate-700">
+                            <span>Adjust WebP compression</span>
+                            <span className="font-semibold">{qualityPercent}%</span>
+                          </div>
+                          <input
+                            type="range"
+                            min="40"
+                            max="100"
+                            step="1"
+                            value={qualityPercent}
+                            onChange={(event) => setQualityPercent(Number(event.target.value))}
+                            className="mt-3 w-full accent-[#4f46e5]"
+                          />
+                          <p className="mt-3 text-sm text-slate-600">
+                            Lower values compress harder. Higher values keep more detail.
+                          </p>
+                          <button
+                            type="button"
+                            className="mt-4 rounded-md bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-60"
+                            onClick={handleCompressAll}
+                            disabled={disableCompress}
+                          >
+                            {isCompressingBatch ? 'Processing...' : 'Process WebP'}
+                          </button>
+                        </div>
+                        <div className="rounded-md border border-slate-200 bg-white p-3">
+                          <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Remembered setting</p>
+                          <p className="mt-2 text-sm text-slate-700">
+                            Your WebP quality is saved locally and reused the next time you return.
+                          </p>
+                        </div>
+                      </div>
+                    )}
 
-                    <div className="mt-5 grid gap-3 sm:grid-cols-2">
-                      <div className="rounded-md border border-slate-200 bg-white p-3">
-                        <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Quick action</p>
-                        <p className="mt-2 text-sm text-slate-700">Edit original images before processing.</p>
+                    {batchMode === 'export' && (
+                      <div className="space-y-4">
+                        <div className="rounded-md border border-slate-200 bg-white p-4">
+                          <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Download summary</p>
+                          <p className="mt-2 text-2xl font-semibold text-slate-900">{readyForZipCount}</p>
+                          <p className="mt-2 text-sm text-slate-600">
+                            Files ready for direct download from this batch.
+                          </p>
+                        </div>
+                        <div className="rounded-md border border-slate-200 bg-white p-3">
+                          <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Export mode</p>
+                          <p className="mt-2 text-sm text-slate-700">
+                            Downloads start individually in sequence, without creating a ZIP file.
+                          </p>
+                        </div>
                       </div>
-                      <div className="rounded-md border border-slate-200 bg-white p-3">
-                        <p className="text-xs uppercase tracking-[0.24em] text-slate-400">Export</p>
-                        <p className="mt-2 text-sm text-slate-700">Download PNG or WebP files individually in sequence.</p>
-                      </div>
-                    </div>
+                    )}
 
                     {globalError && (
                       <p className="mt-4 rounded-md border border-rose-200 bg-rose-50 px-3 py-2.5 text-sm text-rose-700">
@@ -779,13 +824,6 @@ function BackgroundRemoverApp() {
                               </div>
 
                               <div className="mt-4 flex flex-wrap gap-2">
-                                <button
-                                  type="button"
-                                  className="rounded-md border border-slate-200 px-3 py-2 text-xs font-semibold text-slate-800 transition hover:border-slate-300"
-                                  onClick={() => openEditor(item.id, 'original')}
-                                >
-                                  Edit original
-                                </button>
                                 {item.resultBlob && (
                                   <button
                                     type="button"
@@ -806,9 +844,9 @@ function BackgroundRemoverApp() {
 
                               <div className="mt-4 space-y-1 text-sm text-slate-600">
                                 {item.resultBlob ? (
-                                  <p>PNG output: {formatBytes(item.resultSize)}</p>
+                                  <p>Source image: {formatBytes(item.resultSize)}</p>
                                 ) : (
-                                  <p>Waiting for background removal</p>
+                                  <p>Ready for WebP conversion</p>
                                 )}
                                 {item.compressedBlob && (
                                   <p>WebP export: {formatBytes(item.compressedSize)}</p>
