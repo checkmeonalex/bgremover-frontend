@@ -1,0 +1,64 @@
+:root {
+  color-scheme: light;
+  --alxora-bg: #f6f2eb;
+  --alxora-panel: #fffdf9;
+  --alxora-ink: #101828;
+  --alxora-muted: #6b7280;
+  --alxora-line: rgba(24, 24, 27, 0.12);
+  --alxora-gold: #d4af63;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--alxora-bg);
+  color: var(--alxora-ink);
+  font-family: "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+}
+
+a {
+  color: inherit;
+  text-decoration: none;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
+
+#root {
+  min-height: 100vh;
+}
+
+.alxora-shell {
+  background:
+    radial-gradient(circle at top left, rgba(212, 175, 99, 0.12), transparent 28%),
+    radial-gradient(circle at top right, rgba(15, 23, 42, 0.07), transparent 24%),
+    var(--alxora-bg);
+}
+
+.alxora-wordmark {
+  color: #1b1713;
+  font-family: Georgia, "Times New Roman", serif;
+  font-weight: 500;
+  letter-spacing: -0.06em;
+}
+
+.bg-checker {
+  background-image: linear-gradient(45deg, #e2e8f0 25%, transparent 25%),
+    linear-gradient(-45deg, #e2e8f0 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #e2e8f0 75%),
+    linear-gradient(-45deg, transparent 75%, #e2e8f0 75%);
+  background-size: 16px 16px;
+  background-position:
+    0 0,
+    0 8px,
+    8px -8px,
+    -8px 0;
+}
