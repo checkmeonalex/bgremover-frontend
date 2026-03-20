@@ -6,7 +6,20 @@ import ToolsPage from './pages/ToolsPage';
 import { formatBytes } from './utils/formatBytes';
 
 const HEIC_SIGNATURES = ['heic', 'heix', 'hevc', 'hevx', 'mif1', 'msf1'];
-const MAX_BATCH_FILES = 50;
+const SUPPORTED_IMAGE_EXTENSIONS = [
+  'jpg',
+  'jpeg',
+  'png',
+  'webp',
+  'heic',
+  'heif',
+  'tif',
+  'tiff',
+  'bmp',
+  'gif',
+  'avif',
+];
+const MAX_BATCH_FILES = 80;
 const DEFAULT_QUALITY_PERCENT = 90;
 const QUALITY_COOKIE_NAME = 'alxora_webp_quality';
 const STATUS_STYLES = {
@@ -32,20 +45,6 @@ const readSliceAsArrayBuffer = (blob) =>
       }
     };
     reader.readAsArrayBuffer(blob);
-  });
-
-const readFileAsDataURL = (file) =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      if (reader.error) {
-        reject(reader.error);
-      } else {
-        resolve(typeof reader.result === 'string' ? reader.result : '');
-      }
-    };
-    reader.onerror = () => reject(reader.error || new Error('Preview failed'));
-    reader.readAsDataURL(file);
   });
 
 const isLikelyHeic = async (file) => {
@@ -111,15 +110,31 @@ const canvasToBlob = (canvas, type, quality) =>
     );
   });
 
-const renderImageToCanvas = (blob) =>
-  new Promise((resolve, reject) => {
+const renderImageToCanvas = async (blob) => {
+  if (typeof createImageBitmap === 'function') {
+    const bitmap = await createImageBitmap(blob);
+    try {
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const ctx = canvas.getContext('2d', { alpha: false });
+      ctx.drawImage(bitmap, 0, 0);
+      return canvas;
+    } finally {
+      if (typeof bitmap.close === 'function') {
+        bitmap.close();
+      }
+    }
+  }
+
+  return new Promise((resolve, reject) => {
     const img = new Image();
     const objectUrl = URL.createObjectURL(blob);
     img.onload = () => {
       const canvas = document.createElement('canvas');
       canvas.width = img.naturalWidth;
       canvas.height = img.naturalHeight;
-      const ctx = canvas.getContext('2d');
+      const ctx = canvas.getContext('2d', { alpha: false });
       ctx.drawImage(img, 0, 0);
       URL.revokeObjectURL(objectUrl);
       resolve(canvas);
@@ -132,6 +147,7 @@ const renderImageToCanvas = (blob) =>
     };
     img.src = objectUrl;
   });
+};
 
 const sanitizeBaseName = (name, index) => {
   if (!name) return `image-${index + 1}`;
@@ -141,7 +157,31 @@ const sanitizeBaseName = (name, index) => {
   return safe || `image-${index + 1}`;
 };
 
+const getDisplayName = (file) => {
+  const relativePath = file?.webkitRelativePath?.trim();
+  if (relativePath) {
+    return relativePath.replace(/^\/+/, '');
+  }
+  return file?.name || 'image';
+};
+
+const isSupportedImageFile = (file) => {
+  if (!file) return false;
+  if (file.type?.startsWith('image/')) return true;
+  const extension = file.name?.split('.').pop()?.toLowerCase() ?? '';
+  return SUPPORTED_IMAGE_EXTENSIONS.includes(extension);
+};
+
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+const yieldToBrowser = () =>
+  new Promise((resolve) => {
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => resolve());
+      return;
+    }
+    setTimeout(resolve, 0);
+  });
 
 const readQualityCookie = () => {
   if (typeof document === 'undefined') {
@@ -174,6 +214,7 @@ const createItem = (file) => ({
   id: createId(),
   file,
   name: file.name || 'image',
+  displayName: getDisplayName(file),
   previewUrl: '',
   previewLoading: true,
   status: 'pending',
@@ -194,12 +235,14 @@ function BackgroundRemoverApp() {
   const [isZipping, setIsZipping] = useState(false);
   const [qualityPercent, setQualityPercent] = useState(readQualityCookie);
   const [batchMode, setBatchMode] = useState('webp');
+  const [isDragActive, setIsDragActive] = useState(false);
   const [editorState, setEditorState] = useState({
     open: false,
     itemId: null,
     target: 'result',
   });
   const fileInputRef = useRef(null);
+  const folderInputRef = useRef(null);
 
   const itemsRef = useRef(items);
   useEffect(() => {
@@ -279,6 +322,9 @@ function BackgroundRemoverApp() {
     if (fileInputRef.current) {
       fileInputRef.current.value = '';
     }
+    if (folderInputRef.current) {
+      folderInputRef.current.value = '';
+    }
   }, []);
 
   const generatePreview = useCallback(
@@ -293,8 +339,10 @@ function BackgroundRemoverApp() {
             previewLoading: false,
           });
         } else {
-          const dataUrl = await readFileAsDataURL(file);
-          updateItem(id, { previewUrl: dataUrl, previewLoading: false });
+          updateItem(id, {
+            previewUrl: URL.createObjectURL(file),
+            previewLoading: false,
+          });
         }
       } catch {
         updateItem(id, {
@@ -307,16 +355,19 @@ function BackgroundRemoverApp() {
     [updateItem]
   );
 
-  const handleFileChange = useCallback(
-    (event) => {
-      const selectedFiles = Array.from(event.target.files ?? []);
+  const ingestFiles = useCallback(
+    (fileList) => {
+      const selectedFiles = Array.from(fileList ?? []).filter(isSupportedImageFile);
       if (!selectedFiles.length) return;
 
-      const remainingSlots = Math.max(MAX_BATCH_FILES - items.length, 0);
+      const remainingSlots = Math.max(MAX_BATCH_FILES - itemsRef.current.length, 0);
       if (!remainingSlots) {
         setGlobalError(`You can upload up to ${MAX_BATCH_FILES} images in one batch.`);
         if (fileInputRef.current) {
           fileInputRef.current.value = '';
+        }
+        if (folderInputRef.current) {
+          folderInputRef.current.value = '';
         }
         return;
       }
@@ -331,14 +382,63 @@ function BackgroundRemoverApp() {
       );
 
       nextItems.forEach((item) => {
-        generatePreview(item.id, item.file);
+        updateItem(item.id, { previewLoading: true });
       });
+
+      void (async () => {
+        for (const [index, item] of nextItems.entries()) {
+          // eslint-disable-next-line no-await-in-loop
+          await generatePreview(item.id, item.file);
+          if ((index + 1) % 3 === 0) {
+            // eslint-disable-next-line no-await-in-loop
+            await yieldToBrowser();
+          }
+        }
+      })();
 
       if (fileInputRef.current) {
         fileInputRef.current.value = '';
       }
+      if (folderInputRef.current) {
+        folderInputRef.current.value = '';
+      }
     },
-    [generatePreview, items.length]
+    [generatePreview, updateItem]
+  );
+
+  const handleFileChange = useCallback(
+    (event) => {
+      ingestFiles(event.target.files);
+    },
+    [ingestFiles]
+  );
+
+  const handleDragOver = useCallback((event) => {
+    event.preventDefault();
+    setIsDragActive(true);
+  }, []);
+
+  const handleDragEnter = useCallback((event) => {
+    event.preventDefault();
+    setIsDragActive(true);
+  }, []);
+
+  const handleDragLeave = useCallback((event) => {
+    event.preventDefault();
+    const relatedTarget = event.relatedTarget;
+    if (relatedTarget && event.currentTarget.contains(relatedTarget)) {
+      return;
+    }
+    setIsDragActive(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (event) => {
+      event.preventDefault();
+      setIsDragActive(false);
+      ingestFiles(event.dataTransfer?.files);
+    },
+    [ingestFiles]
   );
 
   const compressSingle = useCallback(
@@ -376,18 +476,21 @@ function BackgroundRemoverApp() {
   );
 
   const handleCompressAll = useCallback(async () => {
-    if (!items.length) {
+    if (!itemsRef.current.length) {
       setGlobalError('Add images before creating Alxora-ready WebP exports.');
       return;
     }
     setGlobalError('');
     setIsCompressingBatch(true);
-    for (const item of items) {
+    const itemsToProcess = [...itemsRef.current];
+    for (const item of itemsToProcess) {
       // eslint-disable-next-line no-await-in-loop
       await compressSingle(item);
+      // eslint-disable-next-line no-await-in-loop
+      await yieldToBrowser();
     }
     setIsCompressingBatch(false);
-  }, [compressSingle, items]);
+  }, [compressSingle]);
 
   const handleDownloadAll = useCallback(async () => {
     const readyItems = items.filter((item) => item.compressedBlob);
@@ -598,7 +701,17 @@ function BackgroundRemoverApp() {
           </section>
 
           <section className="mt-6 rounded-lg border border-slate-200 bg-white p-5 shadow-sm sm:p-6">
-            <div className="rounded-md border border-dashed border-slate-300 bg-[#f8f9fd] p-6 sm:p-8">
+            <div
+              className={`rounded-md border border-dashed p-6 transition sm:p-8 ${
+                isDragActive
+                  ? 'border-[#4f46e5] bg-indigo-50'
+                  : 'border-slate-300 bg-[#f8f9fd]'
+              }`}
+              onDragOver={handleDragOver}
+              onDragEnter={handleDragEnter}
+              onDragLeave={handleDragLeave}
+              onDrop={handleDrop}
+            >
               <div className="flex min-h-[260px] flex-col items-center justify-center text-center">
                 <div className="mb-6 flex items-center gap-2">
                   {[0, 1, 2].map((index) => (
@@ -618,12 +731,20 @@ function BackgroundRemoverApp() {
                   Drag and drop images here or click to browse your device.
                 </p>
 
-                <label
-                  htmlFor="file-input"
-                  className="mt-6 inline-flex cursor-pointer items-center justify-center rounded-md bg-[#4f46e5] px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-[#4338ca]"
-                >
-                  Upload images
-                </label>
+                <div className="mt-6 flex flex-wrap items-center justify-center gap-3">
+                  <label
+                    htmlFor="file-input"
+                    className="inline-flex cursor-pointer items-center justify-center rounded-md bg-[#4f46e5] px-4 py-2.5 text-sm font-semibold text-white transition hover:bg-[#4338ca]"
+                  >
+                    Upload images
+                  </label>
+                  <label
+                    htmlFor="folder-input"
+                    className="inline-flex cursor-pointer items-center justify-center rounded-md border border-slate-200 bg-white px-4 py-2.5 text-sm font-semibold text-slate-700 transition hover:border-slate-300"
+                  >
+                    Upload folder
+                  </label>
+                </div>
                 <input
                   ref={fileInputRef}
                   id="file-input"
@@ -634,9 +755,21 @@ function BackgroundRemoverApp() {
                   className="sr-only"
                   onChange={handleFileChange}
                 />
+                <input
+                  ref={folderInputRef}
+                  id="folder-input"
+                  name="folder-files"
+                  type="file"
+                  accept="image/*"
+                  multiple
+                  className="sr-only"
+                  onChange={handleFileChange}
+                  webkitdirectory=""
+                  directory=""
+                />
 
                 <p className="mt-6 text-sm leading-7 text-slate-400">
-                  PNG, JPG, JPEG, WEBP, or HEIC. Upload up to 50 images in one batch.
+                  PNG, JPG, JPEG, WEBP, or HEIC. Upload files or a folder with up to 80 images in one batch.
                 </p>
               </div>
             </div>
@@ -798,7 +931,7 @@ function BackgroundRemoverApp() {
                               ) : item.previewUrl ? (
                                 <img
                                   src={item.previewUrl}
-                                  alt={item.name}
+                                  alt={item.displayName}
                                   className="h-full w-full object-cover"
                                 />
                               ) : (
@@ -811,7 +944,9 @@ function BackgroundRemoverApp() {
                             <div className="p-4">
                               <div className="flex items-start justify-between gap-3">
                                 <div>
-                                  <p className="text-base font-semibold text-slate-900">{item.name}</p>
+                                  <p className="text-base font-semibold text-slate-900 break-all">
+                                    {item.displayName}
+                                  </p>
                                   <p className="mt-1 text-xs uppercase tracking-[0.22em] text-slate-400">
                                     Slot {index + 1}
                                   </p>

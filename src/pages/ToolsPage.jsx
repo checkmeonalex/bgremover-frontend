@@ -39,41 +39,6 @@ const createId = () =>
     ? crypto.randomUUID()
     : `tool-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 7)}`);
 
-const readFileAsDataURL = (file) =>
-  new Promise((resolve, reject) => {
-    const reader = new FileReader();
-    reader.onloadend = () => {
-      if (reader.error) {
-        reject(reader.error);
-      } else {
-        resolve(typeof reader.result === 'string' ? reader.result : '');
-      }
-    };
-    reader.onerror = () => reject(reader.error || new Error('Unable to read the file.'));
-    reader.readAsDataURL(file);
-  });
-
-const loadImage = (src) =>
-  new Promise((resolve, reject) => {
-    const img = new Image();
-    img.onload = () => resolve(img);
-    img.onerror = (event) =>
-      reject(event?.error || new Error('Unsupported image format. Please try another file.'));
-    img.src = src;
-  });
-
-const dataURLToBlob = (dataUrl) => {
-  const parts = dataUrl.split(',');
-  const mimeMatch = parts[0]?.match(/:(.*?);/);
-  const mime = mimeMatch ? mimeMatch[1] : 'image/webp';
-  const binary = atob(parts[1] ?? '');
-  const array = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    array[i] = binary.charCodeAt(i);
-  }
-  return new Blob([array], { type: mime });
-};
-
 const canvasToBlob = (canvas, type = 'image/webp', quality = DEFAULT_WEBP_QUALITY) =>
   new Promise((resolve, reject) => {
     if (typeof canvas.toBlob === 'function') {
@@ -91,24 +56,60 @@ const canvasToBlob = (canvas, type = 'image/webp', quality = DEFAULT_WEBP_QUALIT
       return;
     }
 
+    reject(new Error('WebP export is not supported in this browser.'));
+  });
+
+const renderFileToCanvas = async (file) => {
+  if (typeof createImageBitmap === 'function') {
+    const bitmap = await createImageBitmap(file);
     try {
-      const dataUrl = canvas.toDataURL(type, quality);
-      resolve(dataURLToBlob(dataUrl));
-    } catch (error) {
-      reject(error);
+      const canvas = document.createElement('canvas');
+      canvas.width = bitmap.width;
+      canvas.height = bitmap.height;
+      const context = canvas.getContext('2d', { alpha: false });
+      context.drawImage(bitmap, 0, 0);
+      return canvas;
+    } finally {
+      if (typeof bitmap.close === 'function') {
+        bitmap.close();
+      }
     }
+  }
+
+  const objectUrl = URL.createObjectURL(file);
+  try {
+    const image = await new Promise((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = (event) =>
+        reject(event?.error || new Error('Unsupported image format. Please try another file.'));
+      img.src = objectUrl;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = image.naturalWidth || image.width;
+    canvas.height = image.naturalHeight || image.height;
+    const context = canvas.getContext('2d', { alpha: false });
+    context.drawImage(image, 0, 0);
+    return canvas;
+  } finally {
+    URL.revokeObjectURL(objectUrl);
+  }
+};
+
+const yieldToBrowser = () =>
+  new Promise((resolve) => {
+    if (typeof window !== 'undefined' && typeof window.requestAnimationFrame === 'function') {
+      window.requestAnimationFrame(() => resolve());
+      return;
+    }
+    setTimeout(resolve, 0);
   });
 
 const convertFileToWebpBlob = async (file, quality) => {
-  const dataUrl = await readFileAsDataURL(file);
-  const image = await loadImage(dataUrl);
-  const canvas = document.createElement('canvas');
-  canvas.width = image.naturalWidth || image.width;
-  canvas.height = image.naturalHeight || image.height;
-  const context = canvas.getContext('2d');
-  context.drawImage(image, 0, 0);
+  const canvas = await renderFileToCanvas(file);
   const blob = await canvasToBlob(canvas, 'image/webp', quality);
-  return { blob, originalPreview: dataUrl };
+  return { blob, originalPreview: URL.createObjectURL(file) };
 };
 
 const revokeBlobUrl = (url) => {
@@ -119,6 +120,7 @@ const revokeBlobUrl = (url) => {
 
 const cleanupJobResources = (job) => {
   if (!job) return;
+  revokeBlobUrl(job.originalPreview);
   revokeBlobUrl(job.convertedPreview);
 };
 
@@ -229,13 +231,16 @@ function ToolsPage() {
 
       setJobs((prev) => [...preparedJobs, ...prev]);
 
-      await Promise.all(
-        preparedJobs.map((job) =>
-          convertSingleJob(job.id, job.file).catch(() => {
-            /* handled in convertSingleJob */
-          })
-        )
-      );
+      for (const [index, job] of preparedJobs.entries()) {
+        // eslint-disable-next-line no-await-in-loop
+        await convertSingleJob(job.id, job.file).catch(() => {
+          /* handled in convertSingleJob */
+        });
+        if ((index + 1) % 2 === 0) {
+          // eslint-disable-next-line no-await-in-loop
+          await yieldToBrowser();
+        }
+      }
     },
     [convertSingleJob]
   );
@@ -445,6 +450,9 @@ function ToolsPage() {
                   <p className="mt-3 text-sm text-slate-700">
                     Lower values compress harder and reduce file size more. Higher values keep more image detail.
                   </p>
+                  <p className="mt-2 text-sm text-slate-500">
+                    Exports are re-encoded without camera metadata to keep WebP files smaller.
+                  </p>
                 </div>
               </div>
               <div className="rounded-md border border-slate-200 bg-[#fafbff] p-3">
@@ -453,6 +461,9 @@ function ToolsPage() {
                 </p>
                 <p className="mt-2 text-sm text-slate-700">
                   Current setting: WebP quality {qualityPercent}%. New imports will use this value during conversion.
+                </p>
+                <p className="mt-2 text-sm text-slate-500">
+                  Metadata is stripped during export.
                 </p>
               </div>
             </div>
